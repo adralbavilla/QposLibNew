@@ -1,0 +1,238 @@
+#!groovy
+
+def JDK_INSTALADOS = [
+    'OpenJDK 8'  : '8',
+    'OpenJDK 17' : '17',
+    'OpenJDK 11' : '11',
+]
+
+pipeline { 
+    agent any 
+    options {
+        // Conservar sólo los últimos 15 artefactos generados y las últimas 30 compilaciones
+        buildDiscarder logRotator(artifactNumToKeepStr: '15', numToKeepStr: '30')
+        
+        // Timeout de esperal, cualquier step puede durar un máximo de una hora
+        timeout(time: 1, unit: 'HOURS')
+        
+        // Si la compilación es inestable (test fallan), no continuar y saltar al final
+        //skipStagesAfterUnstable()
+        
+        // Conector de office 365
+        office365ConnectorWebhooks([[
+            name: 'Compilacion de Jenkins',
+            notifyBackToNormal: true,
+            notifyFailure: true,
+            notifySuccess: true,
+            notifyUnstable: true,
+            url: 'https://ibertel.webhook.office.com/webhookb2/cb44294c-43d7-4f52-ab83-3ab80b3d7536@9ef9c2ff-2da6-4314-ae32-8bc14270590b/JenkinsCI/bbb986829efe43f18ec7455576c655fd/d282401c-d4ae-41c5-b7f1-2c12888e2410',
+            factDefinitions: [
+                [name: 'Version de Git compilada', template: '${BRANCH_NAME}'],
+                [name: 'Ver cambios en Git', template: '[Ver en Blue Ocean](${RUN_CHANGES_DISPLAY_URL})'],
+                [name: 'Ver ejecucion', template: '[Ver en Blue Ocean](${RUN_DISPLAY_URL})'],
+                [name: 'Resultado de los tests', template: '[Ver en Blue Ocean](${RUN_TESTS_DISPLAY_URL})'],
+                [name: 'Ir a la tarea', template: '[Ver en Blue Ocean](${JOB_DISPLAY_URL})'],
+                [name: 'Descargar artefactos generados', template: '[Ver en Blue Ocean](${RUN_ARTIFACTS_DISPLAY_URL})']
+            ]
+        ]])
+    }
+    
+    environment {
+        // Versión que se está compilando (sin el "branches/")
+        SCM_VER = "$BRANCH_NAME"
+        
+        // Nombre del proyecto
+        PROYECTO = "${JOB_NAME.split('\\/')[0..-2].join('/')}"
+        
+        // Para deshabilitar algunos tests en jenkins
+        ENV = "jenkins"
+        
+        // Parámetros que se le pasan siempre a gradle
+        GRADLE_PATH = "./gradlew"
+        GRADLE_OPTIONS = "-x check" // Evita que se ejecuten siempre las validaciones y los tests
+        GRADLE_EXEC = "$GRADLE_PATH $GRADLE_OPTIONS" // Comando gradle completo a ejecutar
+    }
+    
+    parameters {
+        // Validadores
+        extendedChoice(
+            defaultValue: 'test, sonar'
+            ,description: 'Validaciones'
+            //,multiSelectDelimiter: ','
+            ,name: 'validaciones'
+            ,type: 'PT_CHECKBOX'
+            ,value: 'test, sonar, depcheck'
+            ,visibleItemCount: 5
+        )
+        // JDK
+        choice(
+            name: 'jdkElegida',
+            choices: JDK_INSTALADOS.keySet() as List,
+            description: "Elija la version del JDK a compilar"
+        )
+        // Por defecto se envía al nexus
+        booleanParam(defaultValue: true, description: 'Enviar al repositorio Maven?', name: 'ENVIAR_REPOSITORIO')
+        
+    }
+    
+    stages {
+        // Prepara todo para compilar
+        stage('Prepare') {
+            steps {
+                script{
+                    // Extrae el JAVA_HOME del map de versiones de java
+                    JAVA_VER = JDK_INSTALADOS.get(jdkElegida)
+                    // Inyecta el parametro que fuerza el uso de un java_home por parte de gradle
+                    GRADLE_EXEC = "${env.GRADLE_EXEC} -PjavaVer=${JAVA_VER}"
+                }
+                
+                echo """
+                ** INFORMACION GENERAL **
+                Proyecto:   ${PROYECTO}
+                Tarea:      ${JOB_NAME}
+                Rama:       ${SCM_VER}
+                
+                ** OPCIONES DE COMPILACIÓN **
+                * Opciones generales *
+                Version java: ${JAVA_VER}
+                Validaciones: ${env.validaciones}
+                Crear javadoc?: ${params.CREAR_JAVADOC}
+                
+                * Gradle *
+                Ejecutable: ${GRADLE_EXEC}
+                """.stripIndent()
+                
+                echo "Comenzando tarea de construccion de $JOB_NAME ($BUILD_ID) en $JENKINS_URL"
+                sh 'chmod +x $GRADLE_PATH'
+                echo "Compilando rama $BRANCH_NAME version $SCM_VER"
+            }
+        }
+        
+         // Solo compilar
+        stage('Build') { 
+            steps {
+                echo 'Construyendo..'
+                sh '$GRADLE_EXEC clean build -x check'
+            }
+        }
+        
+        // Test de unidad
+        stage('Test') {
+            when {
+                expression {
+                    def listaVal = env.validaciones.split(',').toList()
+                    return listaVal.contains('test')
+                }
+            }
+            steps {
+                echo 'Comprobando..'
+                sh "$GRADLE_EXEC test jacocoTestReport"
+            }
+        }
+        
+        // Validaciones adicionales: pmd, findbugs y dependency check
+        stage('Validaciones adicionales') {
+            parallel {
+                stage('Sonar') {
+                    when {
+                        expression {
+                            def listaVal = env.validaciones.split(',').toList()
+                            return listaVal.contains('sonar')
+                        } 
+                    }
+                    steps {
+                        echo 'Analizando con SonarQube..'
+                        withSonarQubeEnv('Local') {
+                            sh "$GRADLE_EXEC --info sonarqube || true"
+                        }
+                    }
+                }
+                stage('Dependency check') {
+                    when {
+                        expression {
+                            def listaVal = env.validaciones.split(',').toList()
+                            return listaVal.contains('depcheck')
+                        }
+                    }
+                    steps {
+                        echo 'Analizando con Dependency Check..'
+                        sh "$GRADLE_EXEC --info dependencyCheckUpdate || true"
+                        sh "$GRADLE_EXEC --info dependencyCheckAnalyze|| true"
+                    }
+                    post {
+                        always {
+                            dependencyCheckPublisher pattern: '**/dependency-check-report.xml'
+                        }
+                    }
+                }
+            }
+        }
+            
+        // Sube las librerías generadas al Apache Archiva
+        stage('Repositorio') {
+            when {
+                expression {
+                    return params.ENVIAR_REPOSITORIO
+                }
+            }
+            // SUBIDA CONDICIONAL: Jenkins se quedará esperando a que el usuario acepte o cancele
+            // input {
+                // message "Subir fullcargalib version $BRANCH_NAME a Nexus?"
+                // ok "Si, subir a Neuxs"
+            // }
+            
+            steps {
+                echo 'Subiendo librerias al repositorio...'
+                sh '$GRADLE_EXEC publish'
+            }
+        }
+    }
+    
+    post {
+        always {
+            // Recoge el resultado de los tests
+            junit allowEmptyResults: true, testResults:'**/build/test-results/**/*.xml'
+            
+            // Recoge los informes de cobertura (jacoco)
+            jacoco classPattern: '**/build/classes/java/main'
+            
+            // Recoge el resultado de los validadores (PMD, spotbugs, java warnings, etc)
+            recordIssues aggregatingResults: true,
+                enabledForFailure: true,
+                tools: [
+                    java()
+                ]
+                
+             // Guarda los artefactos generados (los .jar)
+            archiveArtifacts artifacts: '**/build/outputs/aar/*.aar', fingerprint: true
+            
+            echo "Construccion finalizada. Consulte resultado en ${env.BUILD_URL}"
+            
+            echo "Enviando email..."
+            
+            emailext body: '$DEFAULT_CONTENT',
+                recipientProviders: [
+                    culprits(),
+                    developers(),
+                    requestor()
+                ],
+                subject: '$DEFAULT_SUBJECT',
+                replyTo: '$DEFAULT_REPLYTO',
+                to: '$DEFAULT_RECIPIENTS'
+        }
+        unsuccessful {
+            echo "Ocurrio un error"
+        }
+        regression {
+            echo "Ojo, que vamos a peor"
+        }
+        success {
+            echo "Todo correcto"
+            echo "Limpiando workspace..."
+            cleanWs()
+        }
+        changed {
+            echo "Han habido cambios desde la ultima compilacion."
+        }
+    }
+}

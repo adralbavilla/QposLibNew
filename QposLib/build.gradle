@@ -13,6 +13,9 @@ buildscript {
         maven {
             url "https://nexus.yaganaste.com/repository/gradle_plugins/"
         }
+        maven {
+            url "https://jitpack.io"
+        }
         // Repositorios sin cachear
 
     }

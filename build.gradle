@@ -4,12 +4,13 @@ apply plugin: 'org.sonarqube'
 buildscript {
     repositories {
         google()
+        jcenter()
         mavenCentral()
         maven {
             url "https://plugins.gradle.org/m2/"
         }
-        
     }
+
     dependencies {
         classpath "org.sonarsource.scanner.gradle:sonarqube-gradle-plugin:3.1"
         classpath 'com.android.tools.build:gradle:4.2.2'
@@ -42,6 +43,7 @@ allprojects {
     repositories {
         google()
         mavenCentral()
+        jcenter()
 
         maven {
             url "$mavenInternalUrl"
@@ -49,6 +51,10 @@ allprojects {
 
         maven {
             url "$maven3rdpartyUrl"
+        }
+
+        maven {
+            url "https://jitpack.io"
         }
     }
 }
